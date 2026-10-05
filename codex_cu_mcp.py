@@ -7,6 +7,11 @@ args and env, forwards JSON-RPC in both directions, and adds that metadata to
 tools/call requests that lack it. No Codex agent or model is used; the calling
 harness's model drives the tools.
 
+Ending a turn makes the engine close the tabs that turn opened and detach from
+the browser, as Codex does after every turn. SIGUSR1 ends the current turn and
+starts a new one; `codex_cu_mcp.py end-turn`, run from a harness's stop hook,
+sends it to the proxy of that hook's own session. Exit also ends the turn.
+
 The cua_repl kernel is sandboxed and cannot write files, so images it emits
 (screenshots) are saved here, outside that sandbox, and their paths are
 appended to the tool result for the harness to copy or convert. They live only
@@ -28,6 +33,7 @@ from pathlib import Path
 PLUGIN_DIR = Path.home() / ".codex/plugins/cache/openai-bundled/unified-computer-use"
 IMAGE_ROOT = Path(os.environ.get("CODEX_CU_IMAGE_DIR", Path.home() / ".codex-cu/images"))
 META_KEY = "x-codex-turn-metadata"
+CONTROL_ID_PREFIX = "codex-cu-"
 EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
 
 
@@ -62,6 +68,37 @@ def sweep_orphaned_images():
             shutil.rmtree(directory, ignore_errors=True)
 
 
+def end_turn_for_caller():
+    """Signal the proxies started by the nearest ancestor of this process.
+
+    A harness spawns both its MCP servers and its hook commands, so the closest
+    ancestor that owns a proxy is the hook's own session; proxies of other
+    sessions hang off other processes and are left alone.
+    """
+    table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    parents, proxies = {}, {}
+    script = Path(__file__).name
+    for line in table.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, command = int(parts[0]), int(parts[1]), parts[2]
+        parents[pid] = ppid
+        if script in command and "end-turn" not in command:
+            proxies.setdefault(ppid, []).append(pid)
+    pid = os.getpid()
+    while pid in parents and pid > 1:
+        pid = parents[pid]
+        if pid in proxies:
+            for proxy in proxies[pid]:
+                os.kill(proxy, signal.SIGUSR1)
+            log = os.environ.get("CODEX_CU_HOOK_LOG")
+            if log:
+                with open(log, "a") as handle:
+                    handle.write(f"ended turn: proxies {proxies[pid]} of {pid}\n")
+            return
+
+
 def main():
     sweep_orphaned_images()
     config = load_server_config()
@@ -72,20 +109,37 @@ def main():
         stdout=subprocess.PIPE,
         env=env,
     )
-    # One proxy process is one client session; the turn spans its lifetime.
-    turn = {"session_id": f"codex-cu-{uuid.uuid4()}", "turn_id": str(uuid.uuid4())}
+    session_id = f"codex-cu-{uuid.uuid4()}"
+    turn = {"session_id": session_id, "turn_id": str(uuid.uuid4())}
     image_dir = IMAGE_ROOT / str(os.getpid())
     image_count = 0
+    in_lock = threading.RLock()
     out_lock = threading.Lock()
+    turn_closed = {}
 
     def to_child(message):
-        child.stdin.write((json.dumps(message) + "\n").encode())
-        child.stdin.flush()
+        with in_lock:
+            child.stdin.write((json.dumps(message) + "\n").encode())
+            child.stdin.flush()
 
     def to_client(data):
         with out_lock:
             sys.stdout.buffer.write(data)
             sys.stdout.buffer.flush()
+
+    def end_turn():
+        """Close the current turn in the engine and start a new one."""
+        with in_lock:
+            request_id = f"{CONTROL_ID_PREFIX}{uuid.uuid4()}"
+            done = turn_closed[request_id] = threading.Event()
+            to_child({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": "turn_ended", "arguments": {"hook_event_name": "Stop", **turn}},
+            })
+            turn["turn_id"] = str(uuid.uuid4())
+        return done
 
     def save_images(message):
         nonlocal image_count
@@ -113,11 +167,20 @@ def main():
             except ValueError:
                 to_client(raw)
                 continue
-            if isinstance(message, dict) and save_images(message):
+            if not isinstance(message, dict):
+                to_client(raw)
+                continue
+            # Responses to the proxy's own requests never reach the client.
+            request_id = message.get("id")
+            if isinstance(request_id, str) and request_id in turn_closed:
+                turn_closed.pop(request_id).set()
+                continue
+            if save_images(message):
                 raw = (json.dumps(message) + "\n").encode()
             to_client(raw)
 
     threading.Thread(target=pump_child_output, daemon=True).start()
+    signal.signal(signal.SIGUSR1, lambda *_: end_turn())
     # Harnesses usually stop MCP servers with a signal rather than closing stdin.
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))
@@ -129,29 +192,33 @@ def main():
             try:
                 message = json.loads(raw)
             except ValueError:
-                child.stdin.write(raw)
-                child.stdin.flush()
+                with in_lock:
+                    child.stdin.write(raw)
+                    child.stdin.flush()
                 continue
             if isinstance(message, dict) and message.get("method") == "tools/call":
-                meta = message.setdefault("params", {}).setdefault("_meta", {})
-                meta.setdefault(META_KEY, turn)
+                with in_lock:
+                    meta = message.setdefault("params", {}).setdefault("_meta", {})
+                    meta.setdefault(META_KEY, json.dumps(turn))
+                    to_child(message)
+                continue
             to_child(message)
-        # Let trusted libraries release per-turn resources before shutdown.
-        to_child({
-            "jsonrpc": "2.0",
-            "id": f"codex-cu-shutdown-{uuid.uuid4()}",
-            "method": "tools/call",
-            "params": {"name": "turn_ended", "arguments": {"hook_event_name": "Stop", **turn}},
-        })
-        child.stdin.close()
-        child.wait(timeout=5)
-    except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-        pass
     finally:
+        # Close this session's tabs before the engine goes away.
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        try:
+            end_turn().wait(timeout=5)
+            child.stdin.close()
+            child.wait(timeout=5)
+        except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+            pass
         if child.poll() is None:
             child.kill()
         shutil.rmtree(image_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["end-turn"]:
+        end_turn_for_caller()
+    else:
+        main()

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Register codex-cu and its skill with each harness, or remove them.
+"""Register codex-cu, its skill and its stop hook with each harness, or remove them.
 
 Each harness keeps its own MCP configuration; this uses the harness CLI where
-one exists and edits Cursor's JSON directly. The proxy is registered by its
+one exists and edits JSON directly otherwise. The proxy is registered by its
 absolute path in this checkout, so `git pull` updates every harness at once.
+The stop hook ends the session's computer-use turn, which closes the tabs the
+agent opened during that turn.
 """
 
 import argparse
@@ -19,7 +21,8 @@ SKILL = ROOT / "skills/codex-cu"
 NAME = "codex-cu"
 HOME = Path.home()
 ENGINE = HOME / ".codex/plugins/cache/openai-bundled/unified-computer-use"
-CURSOR_CONFIG = HOME / ".cursor/mcp.json"
+CURSOR_MCP = HOME / ".cursor/mcp.json"
+END_TURN = f'"{PROXY}" end-turn'
 
 # Skill directory each harness reads; Cursor and Grok share ~/.agents/skills.
 SKILL_DIRS = {
@@ -38,6 +41,16 @@ CLI_REMOVE = {
     "devin": ["devin", "mcp", "remove", "-s", "user", NAME],
     "grok": ["grok", "mcp", "remove", "-s", "user", NAME],
 }
+# (config file, keys of the stop-hook list, hook entry) per harness.
+STOP_HOOKS = {
+    "claude": (HOME / ".claude/settings.json", ("hooks", "Stop"),
+               {"hooks": [{"type": "command", "command": END_TURN}]}),
+    "devin": (HOME / ".config/devin/config.json", ("hooks", "Stop"),
+              {"hooks": [{"type": "command", "command": END_TURN}]}),
+    "grok": (HOME / ".grok/hooks/codex-cu.json", ("hooks", "Stop"),
+             {"hooks": [{"type": "command", "command": END_TURN}]}),
+}
+# The Cursor CLI runs no stop hooks in print mode, so Cursor gets none.
 
 
 def run(argv, check=True):
@@ -47,35 +60,60 @@ def run(argv, check=True):
     return result
 
 
-def edit_cursor(add):
-    config = json.loads(CURSOR_CONFIG.read_text()) if CURSOR_CONFIG.exists() else {}
-    servers = config.setdefault("mcpServers", {})
-    if add:
-        servers[NAME] = {"command": str(PROXY), "args": []}
-    else:
+def load_json(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_json(path, config):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def is_ours(hook):
+    text = json.dumps(hook)
+    return str(PROXY) in text and "end-turn" in text
+
+
+def set_server(host, add):
+    if host == "cursor":
+        config = load_json(CURSOR_MCP)
+        servers = config.setdefault("mcpServers", {})
         servers.pop(NAME, None)
-    CURSOR_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CURSOR_CONFIG.write_text(json.dumps(config, indent=2) + "\n")
-
-
-def install(host):
-    if host == "cursor":
-        edit_cursor(add=True)
-    else:
-        run(CLI_REMOVE[host], check=False)
+        if add:
+            servers[NAME] = {"command": str(PROXY), "args": []}
+        save_json(CURSOR_MCP, config)
+        return
+    run(CLI_REMOVE[host], check=False)
+    if add:
         run(CLI_ADD[host])
+
+
+def set_stop_hook(host, add):
+    if host not in STOP_HOOKS:
+        return
+    path, keys, entry = STOP_HOOKS[host]
+    if host == "grok":
+        # Grok loads every file in ~/.grok/hooks; this one is entirely ours.
+        if add:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"hooks": {"Stop": [entry]}}, indent=2) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+        return
+    config = load_json(path)
+    hooks = config.setdefault(keys[0], {})
+    hooks[keys[1]] = [hook for hook in hooks.get(keys[1], []) if not is_ours(hook)]
+    if add:
+        hooks[keys[1]].append(entry)
+    save_json(path, config)
+
+
+def set_skill(host, add):
     target = SKILL_DIRS[host] / NAME
-    shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(SKILL, target)
-
-
-def uninstall(host):
-    if host == "cursor":
-        edit_cursor(add=False)
-    else:
-        run(CLI_REMOVE[host], check=False)
     # Cursor and Grok share ~/.agents/skills: removing either removes it for both.
-    shutil.rmtree(SKILL_DIRS[host] / NAME, ignore_errors=True)
+    shutil.rmtree(target, ignore_errors=True)
+    if add:
+        shutil.copytree(SKILL, target)
 
 
 def check():
@@ -93,14 +131,17 @@ def main():
     check()
     if args.action == "check":
         return
+    add = args.action == "install"
     hosts = list(SKILL_DIRS) if "all" in args.host or not args.host else args.host
     for host in hosts:
         if host != "cursor" and not shutil.which(CLI_ADD[host][0]):
             print(f"{host}: skipped, `{CLI_ADD[host][0]}` not on PATH")
             continue
-        (install if args.action == "install" else uninstall)(host)
+        set_server(host, add)
+        set_stop_hook(host, add)
+        set_skill(host, add)
         print(f"{host}: {args.action}ed")
-    if args.action == "install" and "cursor" in hosts:
+    if add and "cursor" in hosts:
         print("cursor: the Cursor CLI also needs the server in the project's .cursor/mcp.json and --approve-mcps.")
 
 
