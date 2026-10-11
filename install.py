@@ -21,8 +21,11 @@ SKILL = ROOT / "skills/codex-cu"
 NAME = "codex-cu"
 HOME = Path.home()
 ENGINE = HOME / ".codex/plugins/cache/openai-bundled/unified-computer-use"
+CODEX_CONFIG = HOME / ".codex/config.toml"
 CURSOR_MCP = HOME / ".cursor/mcp.json"
 END_TURN = f'"{PROXY}" end-turn'
+WINDOWS = sys.platform == "win32"
+COMMAND = [sys.executable, str(PROXY)] if WINDOWS else [str(PROXY)]
 
 # Skill directory each harness reads; Cursor and Grok share ~/.agents/skills.
 SKILL_DIRS = {
@@ -32,9 +35,9 @@ SKILL_DIRS = {
     "cursor": HOME / ".agents/skills",
 }
 CLI_ADD = {
-    "claude": ["claude", "mcp", "add", "-s", "user", NAME, "--", str(PROXY)],
-    "devin": ["devin", "mcp", "add", "-s", "user", NAME, "--", str(PROXY)],
-    "grok": ["grok", "mcp", "add", "-s", "user", NAME, str(PROXY)],
+    "claude": ["claude", "mcp", "add", "-s", "user", NAME, "--", *COMMAND],
+    "devin": ["devin", "mcp", "add", "-s", "user", NAME, "--", *COMMAND],
+    "grok": ["grok", "mcp", "add", "-s", "user", NAME, *COMMAND],
 }
 CLI_REMOVE = {
     "claude": ["claude", "mcp", "remove", "-s", "user", NAME],
@@ -51,6 +54,8 @@ STOP_HOOKS = {
              {"hooks": [{"type": "command", "command": END_TURN}]}),
 }
 # The Cursor CLI runs no stop hooks in print mode, so Cursor gets none.
+if WINDOWS:
+    STOP_HOOKS = {}
 
 
 def run(argv, check=True):
@@ -80,7 +85,7 @@ def set_server(host, add):
         servers = config.setdefault("mcpServers", {})
         servers.pop(NAME, None)
         if add:
-            servers[NAME] = {"command": str(PROXY), "args": []}
+            servers[NAME] = {"command": COMMAND[0], "args": COMMAND[1:]}
         save_json(CURSOR_MCP, config)
         return
     run(CLI_REMOVE[host], check=False)
@@ -117,6 +122,11 @@ def set_skill(host, add):
 
 
 def check():
+    if WINDOWS:
+        if "[mcp_servers.node_repl]" not in (CODEX_CONFIG.read_text(encoding="utf-8") if CODEX_CONFIG.exists() else ""):
+            raise SystemExit(f"Codex computer-use engine not found in {CODEX_CONFIG}; install and open the Codex app.")
+        print("engine: node_repl")
+        return
     configs = sorted(ENGINE.glob("*/.mcp.json"))
     if not configs:
         raise SystemExit(f"Codex computer-use engine not found under {ENGINE}; install and open the ChatGPT app.")

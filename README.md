@@ -48,7 +48,20 @@ teaches agents how to drive the engine safely.
   each Chromium browser you want to drive (Chrome, Helium, Edge, …). Every
   installation becomes a separate browser for the agent.
 - For native apps: the Accessibility permission the ChatGPT app asks for.
-- Python 3.9+.
+- Python 3.9+ (3.11+ on Windows).
+
+### Windows
+
+The Codex app from the Microsoft Store, signed in and running, provides a
+separate desktop engine (`node_repl`, registered in `~/.codex/config.toml`);
+its browser engine is browser-only there. On Windows the proxy drives that
+desktop engine: native apps only, no browsers. It adds the sandbox state Codex
+sends with every call (a full-access session), without which the engine's
+kernel cannot start outside Codex. The harness must run in the logged-in
+desktop session; an SSH session has no desktop. The first use of each app asks
+"Allow Codex to use <app>?": approve it with "always" once in a Codex chat,
+since a headless harness refuses it. There is no stop hook on Windows; the turn
+ends when the session exits. Install with `python install.py install --host claude`.
 
 ## Install
 
@@ -165,11 +178,16 @@ close the tab.
 Stop hooks were checked by running the four harnesses at once: Claude Code,
 Devin and Grok each ended the turn of their own proxy only.
 
+Windows 11, Codex app 26.1007: Claude Code (`claude -p`) with Claude Haiku 5.5
+(high) found a running desktop app, screenshotted it, clicked a button and
+reported the resulting state ✅.
+
 ## Limits
 
 - **Chrome and native apps only.** Codex's in-app browser exists only inside a
   Codex session and is not reachable here.
-- **macOS only**, and only while the ChatGPT app is installed and running.
+- **macOS and Windows**, and only while the ChatGPT or Codex app is installed
+  and running. On Windows, desktop apps only.
 - **No hover.** The engine sends clicks, drags, scrolls and keystrokes.
 - **Confirmations need MCP elicitation.** Sensitive actions (purchases,
   messages, uploads, settings) ask the client to confirm; a harness without

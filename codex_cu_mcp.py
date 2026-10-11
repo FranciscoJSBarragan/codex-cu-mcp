@@ -30,9 +30,12 @@ import threading
 import uuid
 from pathlib import Path
 
+WINDOWS = sys.platform == "win32"
 PLUGIN_DIR = Path.home() / ".codex/plugins/cache/openai-bundled/unified-computer-use"
+CODEX_CONFIG = Path.home() / ".codex/config.toml"
 IMAGE_ROOT = Path(os.environ.get("CODEX_CU_IMAGE_DIR", Path.home() / ".codex-cu/images"))
 META_KEY = "x-codex-turn-metadata"
+SANDBOX_META_KEY = "codex/sandbox-state-meta"
 CONTROL_ID_PREFIX = "codex-cu-"
 EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
 
@@ -42,6 +45,13 @@ def version_key(path):
 
 
 def load_server_config():
+    if WINDOWS:
+        import tomllib
+
+        servers = tomllib.loads(CODEX_CONFIG.read_text(encoding="utf-8")).get("mcp_servers", {})
+        if "node_repl" not in servers:
+            sys.exit(f"codex-cu: no [mcp_servers.node_repl] in {CODEX_CONFIG}")
+        return servers["node_repl"]
     configs = [d / ".mcp.json" for d in PLUGIN_DIR.iterdir() if (d / ".mcp.json").is_file()]
     if not configs:
         sys.exit(f"codex-cu: no unified-computer-use .mcp.json under {PLUGIN_DIR}")
@@ -50,6 +60,17 @@ def load_server_config():
 
 
 def is_running(pid):
+    if WINDOWS:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return code.value == 259
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -109,6 +130,12 @@ def main():
         stdout=subprocess.PIPE,
         env=env,
     )
+    sandbox_state = {
+        "permissionProfile": {"type": "disabled"},
+        "sandboxCwd": Path.cwd().as_uri(),
+        "useLegacyLandlock": False,
+        "useMxc": False,
+    }
     session_id = f"codex-cu-{uuid.uuid4()}"
     turn = {"session_id": session_id, "turn_id": str(uuid.uuid4())}
     image_dir = IMAGE_ROOT / str(os.getpid())
@@ -180,10 +207,12 @@ def main():
             to_client(raw)
 
     threading.Thread(target=pump_child_output, daemon=True).start()
-    signal.signal(signal.SIGUSR1, lambda *_: end_turn())
+    if not WINDOWS:
+        signal.signal(signal.SIGUSR1, lambda *_: end_turn())
     # Harnesses usually stop MCP servers with a signal rather than closing stdin.
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(sig, lambda *_: sys.exit(0))
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: sys.exit(0))
 
     try:
         for raw in sys.stdin.buffer:
@@ -200,12 +229,15 @@ def main():
                 with in_lock:
                     meta = message.setdefault("params", {}).setdefault("_meta", {})
                     meta.setdefault(META_KEY, json.dumps(turn))
+                    if WINDOWS:
+                        meta.setdefault(SANDBOX_META_KEY, sandbox_state)
                     to_child(message)
                 continue
             to_child(message)
     finally:
         # Close this session's tabs before the engine goes away.
-        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        if not WINDOWS:
+            signal.signal(signal.SIGUSR1, signal.SIG_IGN)
         try:
             end_turn().wait(timeout=5)
             child.stdin.close()

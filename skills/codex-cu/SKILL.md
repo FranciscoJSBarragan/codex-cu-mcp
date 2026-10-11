@@ -1,6 +1,6 @@
 ---
 name: codex-cu
-description: Drive the user's Chromium browsers or macOS apps through the codex-cu MCP server, Codex's computer-use engine, from any harness. Use for browser checks, screenshots, or native-app UI work when the codex-cu `js` tool is available.
+description: Drive the user's Chromium browsers or desktop apps (macOS, Windows) through the codex-cu MCP server, Codex's computer-use engine, from any harness. Use for browser checks, screenshots, or native-app UI work when the codex-cu `js` tool is available.
 ---
 
 # Codex computer use
@@ -19,6 +19,16 @@ returns before anything else:
 - Inventory: `await cua.getState();`
 
 Open tabs straight at their URL. Bindings persist across calls until `js_reset`.
+
+## Windows
+
+On Windows `codex-cu` drives desktop apps only, through Codex's `sky` window
+API; browsers are not available. Before the first call, read the Codex
+computer-use skill at
+`~/.codex/plugins/cache/openai-bundled/computer-use/<version>/skills/computer-use/SKILL.md`
+and the docs it names, and follow them. The first use of each app needs the
+user's approval ("Allow Codex to use <app>?"); a headless session cannot give
+it, so report `Computer Use was not approved to use <app>` and stop.
 
 ## Choosing the browser
 
